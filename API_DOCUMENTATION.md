@@ -21,9 +21,9 @@ Tất cả phản hồi JSON bao gồm:
 
 ## API Endpoints
 
-### 1. POST `/process-image` - Xử Lý Ảnh
+### 1. POST `/api/process-image` - Xử Lý Ảnh
 
-Xử lý ảnh với các bộ lọc khác nhau (mịn, sắc nét, tăng chất lượng, khử nhiễu).
+Xử lý ảnh với nhiều bộ lọc cùng lúc. Tất cả tham số filter đều optional.
 
 #### Request Headers
 
@@ -31,18 +31,20 @@ Xử lý ảnh với các bộ lọc khác nhau (mịn, sắc nét, tăng chất
 Content-Type: multipart/form-data
 ```
 
-#### Query Parameters
+#### Request Body (multipart/form-data)
 
-| Tham số       | Kiểu    | Mặc định | Mô tả                                                |
-| ------------- | ------- | -------- | ---------------------------------------------------- |
-| `filter_type` | string  | `blur`   | Loại bộ lọc: `blur`, `sharpen`, `enhance`, `denoise` |
-| `intensity`   | integer | `1`      | Mức độ xử lý từ 1-5                                  |
+| Trường    | Kiểu    | Bắt buộc | Mô tả                 |
+| --------- | ------- | -------- | --------------------- |
+| `file`    | File    | Có       | Ảnh đầu vào           |
+| `blur`    | integer | Không    | Mức độ blur từ 1-5    |
+| `sharpen` | integer | Không    | Mức độ sharpen từ 1-5 |
+| `enhance` | integer | Không    | Mức độ enhance từ 1-5 |
+| `denoise` | integer | Không    | Mức độ denoise từ 1-5 |
 
-#### Request Body
+Lưu ý:
 
-```
-file: File (multipart/form-data)
-```
+- Cần gửi ít nhất 1 filter (blur/sharpen/enhance/denoise)
+- Thứ tự áp dụng cố định trên backend: `denoise -> blur -> sharpen -> enhance`
 
 #### Response (Thành công - 200)
 
@@ -55,59 +57,88 @@ File nhị phân của ảnh đã xử lý
 
 ```json
 {
-	"error": "Không thể đọc file ảnh. Vui lòng kiểm tra định dạng."
+	"error": "Cần ít nhất một filter: blur, sharpen, enhance, denoise"
 }
 ```
 
-#### Ví dụ Requests
-
-**JavaScript/Fetch:**
+#### Ví dụ Request cơ bản (JavaScript/Fetch)
 
 ```javascript
 const formData = new FormData();
-formData.append("file", imageFile); // HTMLInputElement từ <input type="file">
+formData.append("file", imageFile);
+formData.append("blur", "2");
+formData.append("sharpen", "1");
 
-const response = await fetch(
-	"http://localhost:8000/process-image?filter_type=sharpen&intensity=3",
-	{
+const response = await fetch("http://localhost:8000/api/process-image", {
+	method: "POST",
+	body: formData,
+});
+
+const blob = await response.blob();
+```
+
+#### Chỉnh Ảnh Lần Kế Tiếp: FE Gửi Blob Như Thế Nào?
+
+Backend là stateless, nên lần tiếp theo FE phải tự gửi lại ảnh đầu vào (file hoặc blob) trong field `file`.
+
+1. Trường hợp muốn cộng thêm filter (chain)
+
+- Dùng blob ảnh đã xử lý ở lần trước làm input mới.
+- Gửi lại blob qua `FormData.append("file", blob, "processed.png")`.
+
+```javascript
+async function processNext(currentBlob) {
+	const formData = new FormData();
+	formData.append("file", currentBlob, "processed.png");
+	formData.append("enhance", "2");
+
+	const response = await fetch("http://localhost:8000/api/process-image", {
 		method: "POST",
 		body: formData,
-	},
-);
+	});
 
-// Nhận ảnh đã xử lý
-const blob = await response.blob();
-const url = URL.createObjectURL(blob);
-document.getElementById("image").src = url;
+	if (!response.ok) {
+		throw new Error("Process failed");
+	}
+
+	return await response.blob();
+}
 ```
 
-**Python/Requests:**
+2. Trường hợp muốn đổi cấu hình từ ảnh gốc (không chồng hiệu ứng cũ)
 
-```python
-import requests
+- Không dùng blob đã xử lý trước đó.
+- Gửi lại file gốc ban đầu (`originalFile`) cùng filter mới.
 
-with open('image.jpg', 'rb') as f:
-    files = {'file': f}
-    params = {'filter_type': 'enhance', 'intensity': 2}
-    response = requests.post(
-        'http://localhost:8000/process-image',
-        files=files,
-        params=params
-    )
+```javascript
+async function processFromOriginal(originalFile) {
+	const formData = new FormData();
+	formData.append("file", originalFile);
+	formData.append("blur", "3");
 
-    # Lưu ảnh kết quả
-    with open('processed.png', 'wb') as out:
-        out.write(response.content)
+	const response = await fetch("http://localhost:8000/api/process-image", {
+		method: "POST",
+		body: formData,
+	});
+
+	return await response.blob();
+}
 ```
+
+Khuyến nghị FE:
+
+- Luôn giữ cả `originalFile` và `currentBlob`
+- `currentBlob` dùng để chain filter
+- `originalFile` dùng khi user đổi/reset filter để tránh xử lý chồng nhiều lần
 
 #### Các Bộ Lọc Hỗ Trợ
 
-| Loại      | Mô tả                            | Tham số Intensity                        |
-| --------- | -------------------------------- | ---------------------------------------- |
-| `blur`    | Mịn ảnh (Gaussian Blur)          | Kernel size tăng dần (3→5→7→9→11)        |
-| `sharpen` | Tăng sắc nét                     | Hệ số kernel tăng (9→10→11→12→13)        |
-| `enhance` | Tăng cường độ tương phản (CLAHE) | clipLimit tăng dần (2.0→3.0→4.0→5.0→6.0) |
-| `denoise` | Khử nhiễu                        | Cường độ tăng dần (h = 10→50)            |
+| Loại      | Mô tả                            | Tham số Intensity                            |
+| --------- | -------------------------------- | -------------------------------------------- |
+| `blur`    | Mịn ảnh (Gaussian Blur)          | Kernel size tăng dần (3->5->7->9->11)        |
+| `sharpen` | Tăng sắc nét                     | Hệ số kernel tăng (9->10->11->12->13)        |
+| `enhance` | Tăng cường độ tương phản (CLAHE) | clipLimit tăng dần (2.0->3.0->4.0->5.0->6.0) |
+| `denoise` | Khử nhiễu                        | Cường độ tăng dần (h = 10->50)               |
 
 ---
 
