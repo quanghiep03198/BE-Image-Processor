@@ -2,13 +2,13 @@ from fastapi import FastAPI, APIRouter, UploadFile, File, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.logger import logger
-import cv2
 import numpy as np
-import os
 import io
 from pathlib import Path
 from datetime import datetime
-import logging
+import cv2
+
+# import cv2
 
 app = FastAPI()
 
@@ -25,7 +25,13 @@ router = APIRouter(prefix="/api")
 
 @app.get("/")
 def read_root():
-    return {"Hello": "World"}
+    return {
+        "opencvVersion": cv2.__version__,
+        "deviceCount": cv2.cuda.getCudaEnabledDeviceCount(),
+        "currentDevice": (
+            cv2.cuda.getDevice() if cv2.cuda.getCudaEnabledDeviceCount() > 0 else None
+        ),
+    }
 
 
 # Tạo folder để lưu ảnh nếu chưa tồn tại
@@ -120,6 +126,8 @@ async def process_image(
             )
 
         # Thứ tự áp dụng: denoise -> blur -> sharpen -> enhance -> brightness -> grayscale
+
+        # Denoise: không có CUDA equivalent cho ảnh màu → CPU
         if denoise is not None and denoise > 0:
             # h = 3 + denoise * 3.4 → range: 3 (nhẹ) đến ~20 (mạnh)
             h_val = 3.0 + denoise * 3.4
@@ -132,43 +140,65 @@ async def process_image(
                 searchWindowSize=21,
             )
 
+        # Upload lên GPU cho các bước còn lại
+        gpu_img = cv2.cuda_GpuMat()
+        gpu_img.upload(processed_image)
+
         if blur is not None and blur > 0:
             # blur=1→kernel=5, blur=5→kernel=13. Luôn là số lẻ.
             kernel_size = max(3, int(round(3 + blur * 2)))
             if kernel_size % 2 == 0:
                 kernel_size += 1
-            processed_image = cv2.GaussianBlur(
-                processed_image, (kernel_size, kernel_size), 0
+            gauss_filter = cv2.cuda.createGaussianFilter(
+                cv2.CV_8UC3, cv2.CV_8UC3, (kernel_size, kernel_size), 0
             )
+            gpu_img = gauss_filter.apply(gpu_img)
 
         if sharpen is not None and sharpen > 0:
             # center = 9 + sharpen → range: 9 (nhẹ) đến 14 (sắc nét mạnh)
+            # createLinearFilter chỉ hỗ trợ 1 hoặc 4 kênh → convert BGRA trước
             center = 9.0 + sharpen
-            kernel = np.array([[-1, -1, -1], [-1, center, -1], [-1, -1, -1]])
-            processed_image = cv2.filter2D(processed_image, -1, kernel)
+            kernel = np.array(
+                [[-1, -1, -1], [-1, center, -1], [-1, -1, -1]], dtype=np.float32
+            )
+            gpu_img_4ch = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2BGRA)
+            linear_filter = cv2.cuda.createLinearFilter(
+                cv2.CV_8UC4, cv2.CV_8UC4, kernel
+            )
+            gpu_img_4ch = linear_filter.apply(gpu_img_4ch)
+            gpu_img = cv2.cuda.cvtColor(gpu_img_4ch, cv2.COLOR_BGRA2BGR)
 
         if enhance is not None and enhance > 0:
-            # clipLimit = 1.0 + enhance * 0.6 → range: 1.6 (nhẹ) đến 4.0 (rõ nét)
-            lab = cv2.cvtColor(processed_image, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=1.0 + enhance * 0.6, tileGridSize=(8, 8))
-            l = clahe.apply(l)
-            enhanced = cv2.merge([l, a, b])
-            processed_image = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+            # CLAHE trên GPU (chỉ hoạt động trên kênh đơn)
+            gpu_lab = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2Lab)
+            lab_cpu = gpu_lab.download()
+            l, a, b = cv2.split(lab_cpu)
+            clahe = cv2.cuda.createCLAHE(
+                clipLimit=1.0 + enhance * 0.6, tileGridSize=(8, 8)
+            )
+            gpu_l = cv2.cuda_GpuMat()
+            gpu_l.upload(l)
+            gpu_l = clahe.apply(gpu_l)
+            l = gpu_l.download()
+            enhanced_lab = cv2.merge([l, a, b])
+            gpu_enhanced = cv2.cuda_GpuMat()
+            gpu_enhanced.upload(enhanced_lab)
+            gpu_img = cv2.cuda.cvtColor(gpu_enhanced, cv2.COLOR_Lab2BGR)
 
         if brightness is not None and brightness != 0:
+            # Numpy đã rất nhanh cho phép tính scalar → không đáng upload/download thêm
+            cpu = gpu_img.download()
             offset = 255.0 * brightness
-            processed_image = np.clip(
-                processed_image.astype(np.float32) + offset, 0, 255
-            ).astype(np.uint8)
+            cpu = np.clip(cpu.astype(np.float32) + offset, 0, 255).astype(np.uint8)
+            gpu_img.upload(cpu)
 
         if grayscale is not None and grayscale > 0:
-            gray = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-            gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            gpu_gray = cv2.cuda.cvtColor(gpu_img, cv2.COLOR_BGR2GRAY)
+            gpu_gray_bgr = cv2.cuda.cvtColor(gpu_gray, cv2.COLOR_GRAY2BGR)
             alpha = max(0.0, min(1.0, grayscale))
-            processed_image = cv2.addWeighted(
-                gray_bgr, alpha, processed_image, 1.0 - alpha, 0
-            )
+            gpu_img = cv2.cuda.addWeighted(gpu_gray_bgr, alpha, gpu_img, 1.0 - alpha, 0)
+
+        processed_image = gpu_img.download()
 
         # Mã hóa ảnh thành PNG để gửi trở lại
         success, encoded_image = cv2.imencode(".png", processed_image)
