@@ -174,11 +174,13 @@ async def process_image(
             lab_cpu = gpu_lab.download()
             l, a, b = cv2.split(lab_cpu)
             clahe = cv2.cuda.createCLAHE(
-                clipLimit=1.0 + enhance * 0.6, tileGridSize=(8, 8)
+                clipLimit=1.0 + enhance * 0.6,
+                tileGridSize=(8, 8),
             )
             gpu_l = cv2.cuda_GpuMat()
             gpu_l.upload(l)
-            gpu_l = clahe.apply(gpu_l)
+            # OpenCV CUDA 4.12 Python binding requires an explicit stream argument.
+            gpu_l = clahe.apply(gpu_l, cv2.cuda.Stream_Null())
             l = gpu_l.download()
             enhanced_lab = cv2.merge([l, a, b])
             gpu_enhanced = cv2.cuda_GpuMat()
