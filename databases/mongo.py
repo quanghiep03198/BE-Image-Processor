@@ -1,7 +1,5 @@
 from pymongo import MongoClient
-from dotenv import dotenv_values, load_dotenv
 from fastapi.logger import logger
-from configs import env
 
 global mongo_client, db
 try:
