@@ -4,6 +4,40 @@ import cv2
 import numpy as np
 
 
+def optimize_preview_bytes(
+    raw_bytes: bytes,
+    *,
+    large_image_threshold_bytes: int = 1024 * 1024,
+    max_preview_side: int = 1600,
+    webp_quality: int = 80,
+) -> bytes:
+    if not raw_bytes:
+        raise ValueError("Empty image payload")
+
+    if len(raw_bytes) <= large_image_threshold_bytes:
+        return raw_bytes
+
+    arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+    image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("Image decode failed")
+
+    height, width = image.shape[:2]
+    longest_side = max(height, width)
+    if longest_side > max_preview_side:
+        scale = max_preview_side / float(longest_side)
+        new_width = max(1, int(round(width * scale)))
+        new_height = max(1, int(round(height * scale)))
+        image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+    webp_quality = int(np.clip(webp_quality, 30, 95))
+    ok, encoded = cv2.imencode(".webp", image, [cv2.IMWRITE_WEBP_QUALITY, webp_quality])
+    if not ok:
+        raise ValueError("Preview optimize encode failed")
+
+    return encoded.tobytes()
+
+
 def upload_image_to_gpu(raw_bytes: bytes) -> cv2.cuda.GpuMat:
     if not raw_bytes:
         raise ValueError("Empty image payload")
@@ -34,8 +68,11 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
     denoise = float(params.get("denoise", 0) or 0)
     brightness = float(params.get("brightness", 0) or 0)
     grayscale = float(params.get("grayscale", 0) or 0)
-    jpeg_quality = int(params.get("jpeg_quality", 80) or 80)
+    webp_quality = int(params.get("webp_quality", 80) or 80)
     contrast_bias = float(params.get("contrast_bias", 0) or 0)
+    threshold = float(params.get("threshold", 0) or 0)
+    log_transform = float(params.get("log_transform", 0) or 0)
+    power_law = float(params.get("power_law", params.get("gamma", 1.0)) or 1.0)
 
     try:
         gpu_out = gpu_src.clone()
@@ -71,18 +108,26 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
 
     # --- Sharpen (GPU linear filter, requires BGRA) ---
     if sharpen > 0:
-        center = float(np.clip(9.0 + sharpen, 9.0, 14.0))
-        kernel = np.array([[0, -1, 0], [-1, center, -1], [0, -1, 0]], dtype=np.float32)
+        sharpen_strength = float(np.clip(sharpen / 5.0, 0.0, 1.0))
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
         try:
+            gpu_base = gpu_out.clone()
             gpu_bgra = cv2.cuda.cvtColor(gpu_out, cv2.COLOR_BGR2BGRA)
             sharpen_filter = cv2.cuda.createLinearFilter(
                 cv2.CV_8UC4, cv2.CV_8UC4, kernel
             )
             gpu_bgra = sharpen_filter.apply(gpu_bgra)
-            gpu_out = cv2.cuda.cvtColor(gpu_bgra, cv2.COLOR_BGRA2BGR)
+            gpu_sharp = cv2.cuda.cvtColor(gpu_bgra, cv2.COLOR_BGRA2BGR)
+            gpu_out = cv2.cuda.addWeighted(
+                gpu_sharp, sharpen_strength, gpu_base, 1.0 - sharpen_strength, 0
+            )
         except Exception:
+            cpu_base = gpu_out.download()
             cpu_sh = gpu_out.download()
             cpu_sh = cv2.filter2D(cpu_sh, -1, kernel)
+            cpu_sh = cv2.addWeighted(
+                cpu_sh, sharpen_strength, cpu_base, 1.0 - sharpen_strength, 0
+            )
             gpu_out = cv2.cuda_GpuMat()
             gpu_out.upload(cpu_sh)
 
@@ -113,16 +158,8 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
             gpu_out.upload(cpu_en)
 
     # --- Brightness / Contrast ---
-    alpha = 1.0 + brightness
-    beta = contrast_bias
-    apply_cpu_brightness = False
-    if abs(alpha - 1.0) > 1e-6 or abs(beta) > 1e-6:
-        try:
-            gpu_out = cv2.cuda.addWeighted(gpu_out, alpha, gpu_out, 0.0, beta)
-            if gpu_out.empty():
-                apply_cpu_brightness = True
-        except Exception:
-            apply_cpu_brightness = True
+    brightness_offset = float(np.clip(brightness, -1.0, 1.0)) * 255.0
+    contrast_alpha = float(np.clip(1.0 + contrast_bias, 0.2, 3.0))
 
     # --- Grayscale blend ---
     if grayscale > 0:
@@ -144,17 +181,46 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
     if cpu_out is None or cpu_out.size == 0:
         raise ValueError("Downloaded preview frame is empty")
 
-    if apply_cpu_brightness:
+    if abs(brightness_offset) > 1e-6 or abs(contrast_alpha - 1.0) > 1e-6:
         cpu_float = cpu_out.astype(np.float32)
-        cpu_out = np.clip(cpu_float * alpha + beta, 0, 255).astype(np.uint8)
+        cpu_out = np.clip(
+            (cpu_float - 127.5) * contrast_alpha + 127.5 + brightness_offset,
+            0,
+            255,
+        ).astype(np.uint8)
 
-    jpeg_quality = max(1, min(100, jpeg_quality))
+    # --- Logarithmic transform (CPU) ---
+    if log_transform > 0:
+        log_strength = float(np.clip(log_transform, 0.0, 1.0))
+        cpu_float = cpu_out.astype(np.float32)
+        c = 255.0 / np.log1p(255.0)
+        cpu_log = np.clip(c * np.log1p(cpu_float), 0, 255).astype(np.uint8)
+        if log_strength >= 1.0:
+            cpu_out = cpu_log
+        else:
+            cpu_out = cv2.addWeighted(cpu_out, 1.0 - log_strength, cpu_log, log_strength, 0)
+
+    # --- Power-law / Gamma transform (CPU) ---
+    if abs(power_law - 1.0) > 1e-6:
+        gamma = max(1e-6, power_law)
+        cpu_norm = cpu_out.astype(np.float32) / 255.0
+        cpu_out = np.clip(np.power(cpu_norm, gamma) * 255.0, 0, 255).astype(np.uint8)
+
+    # --- Threshold (CPU, binary) ---
+    if threshold > 0:
+        threshold_value = threshold * 255.0 if threshold <= 1.0 else threshold
+        threshold_value = float(np.clip(threshold_value, 0.0, 255.0))
+        gray = cv2.cvtColor(cpu_out, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
+        cpu_out = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    webp_quality = max(1, min(100, webp_quality))
     ok, encoded = cv2.imencode(
-        ".jpg",
+        ".webp",
         cpu_out,
-        [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+        [cv2.IMWRITE_WEBP_QUALITY, webp_quality],
     )
     if not ok:
-        raise ValueError("JPEG encode failed")
+        raise ValueError("WEBP encode failed")
 
     return encoded.tobytes()
