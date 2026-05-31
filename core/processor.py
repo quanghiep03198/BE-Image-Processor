@@ -62,7 +62,9 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
     except Exception as exc:
         raise ValueError("gpu_src is invalid") from exc
 
-    blur = float(params.get("blur", 0) or 0)
+    gaussian_blur = float(params.get("gaussian_blur", 0) or 0)
+    median_blur = float(params.get("median_blur", 0) or 0)
+    bilateral_blur = float(params.get("bilateral_blur", 0) or 0)
     sharpen = float(params.get("sharpen", 0) or 0)
     enhance = float(params.get("enhance", 0) or 0)
     denoise = float(params.get("denoise", 0) or 0)
@@ -73,6 +75,13 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
     threshold = float(params.get("threshold", 0) or 0)
     log_transform = float(params.get("log_transform", 0) or 0)
     power_law = float(params.get("power_law", params.get("gamma", 1.0)) or 1.0)
+    histogram_r = float(params.get("histogram.r", 0) or 0)
+    histogram_g = float(params.get("histogram.g", 0) or 0)
+    histogram_b = float(params.get("histogram.b", 0) or 0)
+    histogram_a = float(
+        params.get("histogram.a", params.get("histogram_a", 1.0)) or 1.0
+    )
+    histogram_a = float(np.clip(histogram_a, 0.0, 1.0))
 
     try:
         gpu_out = gpu_src.clone()
@@ -94,8 +103,8 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
         gpu_out.upload(cpu_dn)
 
     # --- Blur (GPU Gaussian) ---
-    if blur > 0:
-        kernel_size = max(3, int(round(3 + blur * 2)))
+    if gaussian_blur > 0:
+        kernel_size = max(3, int(round(3 + gaussian_blur * 2)))
         if kernel_size % 2 == 0:
             kernel_size += 1
         blur_filter = cv2.cuda.createGaussianFilter(
@@ -105,6 +114,25 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
             0,
         )
         gpu_out = blur_filter.apply(gpu_out)
+
+    # --- Median Blur (CPU) ---
+    if median_blur > 0:
+        cpu_mb = gpu_out.download()
+        ksize = max(3, int(round(3 + median_blur * 2)))
+        if ksize % 2 == 0:
+            ksize += 1
+        cpu_mb = cv2.medianBlur(cpu_mb, ksize)
+        gpu_out = cv2.cuda_GpuMat()
+        gpu_out.upload(cpu_mb)
+
+    # --- Bilateral Blur (CPU) ---
+    if bilateral_blur > 0:
+        cpu_bl = gpu_out.download()
+        d = max(5, int(round(5 + bilateral_blur * 4)))
+        sigma = 10.0 + bilateral_blur * 15.0
+        cpu_bl = cv2.bilateralFilter(cpu_bl, d, sigma, sigma)
+        gpu_out = cv2.cuda_GpuMat()
+        gpu_out.upload(cpu_bl)
 
     # --- Sharpen (GPU linear filter, requires BGRA) ---
     if sharpen > 0:
@@ -213,6 +241,14 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
         gray = cv2.cvtColor(cpu_out, cv2.COLOR_BGR2GRAY)
         _, binary = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
         cpu_out = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+    # --- Per-channel histogram adjustment (R, G, B) with alpha strength ---
+    if abs(histogram_r) > 1e-6 or abs(histogram_g) > 1e-6 or abs(histogram_b) > 1e-6:
+        b_ch, g_ch, r_ch = cv2.split(cpu_out.astype(np.float32))
+        r_ch = np.clip(r_ch + histogram_r * 255.0 * histogram_a, 0, 255)
+        g_ch = np.clip(g_ch + histogram_g * 255.0 * histogram_a, 0, 255)
+        b_ch = np.clip(b_ch + histogram_b * 255.0 * histogram_a, 0, 255)
+        cpu_out = cv2.merge([b_ch, g_ch, r_ch]).astype(np.uint8)
 
     webp_quality = max(1, min(100, webp_quality))
     ok, encoded = cv2.imencode(
