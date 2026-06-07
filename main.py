@@ -58,9 +58,11 @@ try:
                 else None
             ),
         }
-    
+
     @app.get("/images/{filename}")
-    async def show_image(  filename: str,):
+    async def show_image(
+        filename: str,
+    ):
         """
         API hiển thị ảnh đã lưu từ backend.
         """
@@ -77,7 +79,6 @@ try:
                 return JSONResponse(
                     status_code=404, content={"error": "File không tồn tại"}
                 )
-       
 
             return FileResponse(file_path, media_type="image/png")
 

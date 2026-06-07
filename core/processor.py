@@ -226,7 +226,9 @@ def process_frame_cuda(gpu_src: cv2.cuda.GpuMat, params: dict) -> bytes:
         if log_strength >= 1.0:
             cpu_out = cpu_log
         else:
-            cpu_out = cv2.addWeighted(cpu_out, 1.0 - log_strength, cpu_log, log_strength, 0)
+            cpu_out = cv2.addWeighted(
+                cpu_out, 1.0 - log_strength, cpu_log, log_strength, 0
+            )
 
     # --- Power-law / Gamma transform (CPU) ---
     if abs(power_law - 1.0) > 1e-6:

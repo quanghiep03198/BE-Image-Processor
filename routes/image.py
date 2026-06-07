@@ -45,7 +45,8 @@ async def save_image(
         image_bytes = session_id and image_store.get(session_id)
         if image_bytes is None:
             return JSONResponse(
-                status_code=400, content={"error": "Session ID không hợp lệ hoặc đã hết hạn"}
+                status_code=400,
+                content={"error": "Session ID không hợp lệ hoặc đã hết hạn"},
             )
 
         # Phát hiện định dạng ảnh để xác định phần mở rộng và MIME type
@@ -75,7 +76,9 @@ async def save_image(
 
         # Lấy thông tin user từ request state (được set bởi auth middleware)
         user = req.state.user
-        user_id = user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+        user_id = (
+            user.get("id") if isinstance(user, dict) else getattr(user, "id", None)
+        )
         if user_id is None:
             return JSONResponse(status_code=401, content={"error": "Unauthorized"})
 
@@ -127,28 +130,26 @@ async def get_saved_images(req=Depends(auth_middleware)):
     try:
         if not IMAGES_FOLDER.exists():
             return {"images": []}
-        
 
-        images = await ImageModel.aggregate(aggregation_pipeline=[
-            {"$match": {"user_created": PydanticObjectId(req.state.user["id"])} },
-            {"$lookup": {
-                "from": "users",
-                    "localField": "user_created",   
-                    "foreignField": "_id",
-                    "as": "owner"
-            }},
-            {"$unwind": {"path": "$owner"}},
-         
-        ], projection_model=ImageWithUser
+        images = await ImageModel.aggregate(
+            aggregation_pipeline=[
+                {"$match": {"user_created": PydanticObjectId(req.state.user["id"])}},
+                {
+                    "$lookup": {
+                        "from": "users",
+                        "localField": "user_created",
+                        "foreignField": "_id",
+                        "as": "owner",
+                    }
+                },
+                {"$unwind": {"path": "$owner"}},
+            ],
+            projection_model=ImageWithUser,
         ).to_list()
 
         images = [image.model_dump(mode="json") for image in images]
 
-        return JSONResponse(
-            status_code=200,
-            content=images
-        )
-        
+        return JSONResponse(status_code=200, content=images)
 
     except Exception as e:
         return JSONResponse(
@@ -174,16 +175,25 @@ async def download_image(filename: str, req=Depends(auth_middleware)):
             return JSONResponse(
                 status_code=404, content={"error": "File không tồn tại"}
             )
-        
-             
-        in_mem_file = (await ImageModel.find_one({
-            "url": str(file_path),
-            "user_created": PydanticObjectId(req.state.user["id"]),
-        })).model_dump(mode='json') 
+
+        in_mem_file = (
+            await ImageModel.find_one(
+                {
+                    "url": str(file_path),
+                    "user_created": PydanticObjectId(req.state.user["id"]),
+                }
+            )
+        ).model_dump(mode="json")
 
         # print("in_mem_file :>> f{}", in_mem_file.model_dump(mode='json'))
 
-        return FileResponse(file_path, media_type=in_mem_file["mime_type"] if in_mem_file else "application/octet-stream", filename=in_mem_file["name"] if in_mem_file else filename)
+        return FileResponse(
+            file_path,
+            media_type=(
+                in_mem_file["mime_type"] if in_mem_file else "application/octet-stream"
+            ),
+            filename=in_mem_file["name"] if in_mem_file else filename,
+        )
 
     except Exception as e:
         return JSONResponse(
@@ -202,13 +212,11 @@ async def rename_image(
     """
 
     name = payload.name.strip()
-    
+
     try:
         image = await ImageModel.get(PydanticObjectId(image_id))
         if not image:
-            return JSONResponse(
-                status_code=404, content= "Ảnh không tồn tại"
-            )
+            return JSONResponse(status_code=404, content="Ảnh không tồn tại")
 
         # Kiểm tra quyền sở hữu ảnh
         if str(image.user_created) != req.state.user["id"]:
@@ -217,9 +225,7 @@ async def rename_image(
             )
 
         if not name:
-            return JSONResponse(
-                status_code=400, content="Tên ảnh không hợp lệ"
-            )
+            return JSONResponse(status_code=400, content="Tên ảnh không hợp lệ")
 
         # Đổi tên file trên filesystem, luôn giữ extension gốc của ảnh
         old_file_path = Path(image.url)
@@ -230,9 +236,7 @@ async def rename_image(
         new_file_path = old_file_path.with_name(new_filename)
 
         if new_file_path.exists():
-            return JSONResponse(
-                status_code=400, content="Tên file mới đã tồn tại"
-            )
+            return JSONResponse(status_code=400, content="Tên file mới đã tồn tại")
 
         old_file_path.rename(new_file_path)
 
@@ -241,14 +245,11 @@ async def rename_image(
         image.name = new_filename
         await image.save()
 
-        return JSONResponse(
-            status_code=200, content="Ảnh đã được đổi tên thành công"
-        )
+        return JSONResponse(status_code=200, content="Ảnh đã được đổi tên thành công")
 
     except Exception as e:
-        return JSONResponse(
-            status_code=500, content=f"Lỗi đổi tên ảnh: {str(e)}"
-        )
+        return JSONResponse(status_code=500, content=f"Lỗi đổi tên ảnh: {str(e)}")
+
 
 @router.delete("/{image_id}")
 async def delete_image(image_id: str, req=Depends(auth_middleware)):
@@ -258,9 +259,7 @@ async def delete_image(image_id: str, req=Depends(auth_middleware)):
     try:
         image = await ImageModel.get(PydanticObjectId(image_id))
         if not image:
-            return JSONResponse(
-                status_code=404, content={"error": "Ảnh không tồn tại"}
-            )
+            return JSONResponse(status_code=404, content={"error": "Ảnh không tồn tại"})
 
         # Kiểm tra quyền sở hữu ảnh
         if str(image.user_created) != req.state.user["id"]:
@@ -283,4 +282,4 @@ async def delete_image(image_id: str, req=Depends(auth_middleware)):
     except Exception as e:
         return JSONResponse(
             status_code=500, content={"error": f"Lỗi xóa ảnh: {str(e)}"}
-        )   
+        )

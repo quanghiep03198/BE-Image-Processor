@@ -25,6 +25,7 @@ class ImageModel(Document):
     class Config:
         json_encoders = {PydanticObjectId: str}
 
+
 class ImageWithUser(BaseModel):
     id: str = Field(alias="_id")
     name: str
@@ -41,6 +42,7 @@ class ImageWithUser(BaseModel):
     @classmethod
     def convert_objectid(cls, v: Any) -> str:
         return str(v)
+
 
 class RenameImagePayload(BaseModel):
     name: str

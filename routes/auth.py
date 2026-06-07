@@ -76,7 +76,7 @@ async def signin(
     pwd_hash = user["password"]
     if isinstance(pwd_hash, str):
         pwd_hash = pwd_hash.encode("utf-8")
-    
+
     if not checkpw(payload.password.encode("utf-8"), pwd_hash):
         raise HTTPException(status_code=400, detail="Invalid password")
 
@@ -114,8 +114,10 @@ async def signin(
 async def signout(
     credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
 ):
-    
-    await RevokeTokenModel(token=credentials.credentials, revoked_at=datetime.now()).insert()
+
+    await RevokeTokenModel(
+        token=credentials.credentials, revoked_at=datetime.now()
+    ).insert()
     # revoked_token = RevokeTokenModel(token=credentials.credentials)
 
     # revoked_token = await revoked_token.insert()
